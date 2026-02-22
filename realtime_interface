@@ -1,38 +1,254 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from collections import deque
+from collections import deque, defaultdict
 import tensorflow as tf
 import time
-import pyautogui
+import threading
+import subprocess
+import socket
+import http.server
+import urllib.parse
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 SEQ_LENGTH = 20
 FEATURE_SIZE = 63
-CONF_THRESHOLD = 0.95
+CONF_THRESHOLD = 0.85    # global threshold; vertical swipes need more leniency
 COOLDOWN_TIME = 3
 FREEZE_TIME = 0.6
 
-VELOCITY_GATE = 0.001
-MIN_TRAVEL = 0.005
-DEAD_ZONE = 0.005
-MIN_DIR_FRAMES = 1
+# Robust pinch toggle (multi-finger)
+PINCH_INDEX_MAX = 0.050  # was 0.055 — slightly stricter, reduces false pinches
+PINCH_OTHERS_MIN = 0.080 # was 0.075 — must be more open to confirm non-pinch fingers
+PINCH_DEBOUNCE = 0.55    # was 0.35 — longer debounce prevents rapid flicker toggling
 
+pinch_history = deque(maxlen=5)
+last_pinch_toggle = 0
+
+# Hand appearance grace period
+hand_present_frames = 0
+hand_absent_frames = 0
+HAND_APPEAR_GRACE = 8   # ignore gestures for first N frames
+
+# Prediction smoothing / confirmation (lightweight)
+PRED_BUFFER_LEN = 5
+pred_buffer = deque(maxlen=PRED_BUFFER_LEN)
+CONFIRM_COUNT_H = 3   # horizontal swipes: stricter
+CONFIRM_COUNT_V = 2   # vertical swipes: more lenient, model scores these lower
+
+# Per-gesture cooldowns and opposite-swipe debounce
+PER_GESTURE_COOLDOWN = defaultdict(lambda: 0.0)
+OPPOSITE_DEBOUNCE_H = 1.2  # left/right: long debounce to block drift-back false triggers
+OPPOSITE_DEBOUNCE_V = 0.3  # up/down: short debounce so both directions stay freely usable
+last_swipe = None
+last_swipe_time = 0.0
+
+# Minimum hand bbox area to accept gestures (avoid tiny/partial hands)
+MIN_HAND_AREA = 0.0025
+
+
+
+# -----------------------------
+# DOCUMENT DOCK
+# -----------------------------
+documents = [
+    {"name": "General Test", "path": r"D:\\FilesToSend\\test.txt"},
+    {"name": "Word Test", "path": r"D:\\FilesToSend\\Words.txt"},
+    {"name": "Number Test", "path": r"D:\FilesToSend\Numbers.txt"},
+    {"name": "Encrypted Message", "path": r"D:\\FilesToSend\\Encrypted.txt"}
+]
+
+current_index = 0
+file_mode = False
+armed = False
+
+# -----------------------------
+# STATE VARIABLES
+# -----------------------------
 last_action_time = 0
 freeze_until = 0
-reentry_freeze_until = 0
 
-prev_x = None
-motion_acc = 0.0
-dir_consistency = 0
-current_dir = 0
-last_block_reason = ""
+# Two-hand debounce
+two_hand_frames = 0
+one_hand_frames = 0
+TWO_HAND_THRESHOLD = 5
+ONE_HAND_THRESHOLD = 5
+two_hands_active = False
 
+# -----------------------------
+# MODEL
+# -----------------------------
 model = tf.keras.models.load_model("gesture_model.h5")
 label_classes = np.load("gesture_labels.npy", allow_pickle=True)
 
 def extract_features(hand_landmarks):
     return [coord for lm in hand_landmarks.landmark for coord in (lm.x, lm.y, lm.z)]
 
+# -----------------------------
+# HELPERS
+# -----------------------------
+def pinch_metrics(hand):
+    thumb = hand.landmark[4]
+    index = hand.landmark[8]
+    middle = hand.landmark[12]
+    ring = hand.landmark[16]
+
+    def d(a, b):
+        return np.sqrt((a.x - b.x)**2 + (a.y - b.y)**2 + (a.z - b.z)**2)
+
+    return d(thumb, index), d(thumb, middle), d(thumb, ring)
+
+def reset_state():
+    pinch_history.clear()
+    pred_buffer.clear()
+    sequence.clear()
+
+# -----------------------------
+# BLUETOOTH CONFIG
+# -----------------------------
+bt_status_message = ""     # shown on overlay
+bt_status_time = 0
+
+def set_bt_status(msg):
+    global bt_status_message, bt_status_time
+    bt_status_message = msg
+    bt_status_time = time.time()
+    print(f"[BT] {msg}")
+
+# -----------------------------
+# NETWORK FILE SEND CONFIG
+# -----------------------------
+HOST_IP = "192.168.137.1"   # your hotspot IP
+HOST_PORT = 8765
+SERVER_TIMEOUT = 120        # seconds before server shuts down
+
+active_server = None
+
+class SingleFileHandler(http.server.BaseHTTPRequestHandler):
+    filepath = None
+    filename = None
+
+    def do_GET(self):
+        if self.path == "/file":
+            try:
+                with open(self.filepath, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{self.filename}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                set_bt_status(f"File sent successfully!")
+                # Shut down server in background thread after file is delivered
+                def _shutdown():
+                    global active_server
+                    self.server.shutdown()
+                    active_server = None
+                threading.Thread(target=_shutdown, daemon=True).start()
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+        elif self.path == "/":
+            # Simple accept page shown in browser
+            html = f"""<html><body style="font-family:sans-serif;text-align:center;padding:50px">
+            <h2>Incoming file: {self.filename}</h2>
+            <p>Someone wants to send you a file.</p>
+            <a href="/file" style="background:#4CAF50;color:white;padding:15px 30px;
+            text-decoration:none;border-radius:8px;font-size:18px">Accept & Download</a>
+            </body></html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # suppress server logs
+
+def send_document(doc):
+    """Serve file over HTTP on hotspot, open browser on receiver with accept page."""
+    def _send():
+        global active_server
+
+        filepath = doc["path"]
+        filename = filepath.replace("\\", "/").split("/")[-1]
+
+        # Don't call shutdown on old server — it can block forever if loop already ended
+        # allow_reuse_address handles port recycling
+
+        SingleFileHandler.filepath = filepath
+        SingleFileHandler.filename = filename
+
+        try:
+            http.server.HTTPServer.allow_reuse_address = True
+            server = http.server.HTTPServer((HOST_IP, HOST_PORT), SingleFileHandler)
+            active_server = server
+            url = f"http://{HOST_IP}:{HOST_PORT}/"
+            set_bt_status(f"Ready — tell receiver to open: {url}")
+            print(f"[NET] Serving at {url} — waiting for receiver...")
+            server.timeout = SERVER_TIMEOUT
+            # Serve until timeout
+            import time as _time
+            deadline = _time.time() + SERVER_TIMEOUT
+            while _time.time() < deadline:
+                server.handle_request()
+            active_server = None
+        except Exception as e:
+            active_server = None
+            set_bt_status(f"Server error: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+    set_bt_status(f"Starting file server for {doc['name']}...")
+
+def draw_doc_ui(frame):
+    x, y = 20, 50
+    h = 30
+
+    for i, doc in enumerate(documents):
+        color = (255, 255, 255)
+        if i == current_index:
+            color = (0, 255, 255)
+        if i == current_index and armed:
+            color = (0, 255, 0)
+
+        cv2.putText(frame, doc["name"], (x, y + i*h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    mode_text = "FILE MODE (pinch toggled)" if file_mode else "PRESENTATION MODE"
+    cv2.putText(frame, mode_text, (x, y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
+
+    if armed and not file_mode:
+        cv2.putText(frame, "ARMED (swipe up to send, down to cancel)",
+                    (x, y + (len(documents)+2)*h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    # BT status overlay — show for 5 seconds after last update
+    if bt_status_message and (time.time() - bt_status_time) < 5:
+        cv2.putText(frame, bt_status_message, (x, y + (len(documents)+4)*h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+
+# Compute normalized bounding box area of hand to ensure it's large enough
+def hand_bbox_area(hand):
+    xs = [lm.x for lm in hand.landmark]
+    ys = [lm.y for lm in hand.landmark]
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    return w * h
+
+# Lightweight confirmation: require a label to appear `count` times in buffer
+def confirm_from_buffer(candidate_label, count):
+    labels = [lbl for lbl, conf in pred_buffer]
+    return labels.count(candidate_label) >= count
+
+# -----------------------------
+# MEDIAPIPE SETUP
+# -----------------------------
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
@@ -40,139 +256,241 @@ cap = cv2.VideoCapture(0)
 sequence = deque(maxlen=SEQ_LENGTH)
 
 with mp_hands.Hands(max_num_hands=2,
-                    min_detection_confidence=0.3,
-                    min_tracking_confidence=0.3) as hands:
+                    min_detection_confidence=0.4,
+                    min_tracking_confidence=0.4) as hands:
 
     while True:
         success, frame = cap.read()
         if not success:
             continue
 
+        # FIX CAMERA MIRRORING
+        frame = cv2.flip(frame, 1)
+
         frame = cv2.resize(frame, (1280, 720))
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb)
 
-        if time.time() < freeze_until:
+        now = time.time()
+
+        # -----------------------------
+        # GLOBAL FREEZE
+        # -----------------------------
+        if now < freeze_until:
             cv2.putText(frame, "Freeze...", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 100, 255), 2)
+            draw_doc_ui(frame)
             cv2.imshow("Gesture Control", frame)
             if cv2.waitKey(1) & 0xFF == 27: break
             continue
 
-        if time.time() < reentry_freeze_until:
-            cv2.putText(frame, "Stabilizing...", (10, 180),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 150, 0), 2)
-            prev_x = None
-            motion_acc = 0.0
-            dir_consistency = 0
-            current_dir = 0
-            last_block_reason = "reentry"
-            cv2.imshow("Gesture Control", frame)
-            if cv2.waitKey(1) & 0xFF == 27: break
-            continue
+        # -----------------------------
+        # HAND PRESENCE TRACKING
+        # -----------------------------
+        if results.multi_hand_landmarks:
+            hand_present_frames += 1
+            hand_absent_frames = 0
+        else:
+            hand_absent_frames += 1
+            if hand_absent_frames > 3:
+                hand_present_frames = 0
+                reset_state()
+                sequence.clear()
 
-        if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 1:
-            cv2.putText(frame, "Two hands detected - disabled", (10, 150),
+        # -----------------------------
+        # TWO-HAND DEBOUNCE
+        # -----------------------------
+        hand_count = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
+
+        if hand_count > 1:
+            two_hand_frames += 1
+            one_hand_frames = 0
+        else:
+            one_hand_frames += 1
+            two_hand_frames = 0
+
+        if two_hand_frames >= TWO_HAND_THRESHOLD:
+            two_hands_active = True
+        if one_hand_frames >= ONE_HAND_THRESHOLD:
+            two_hands_active = False
+
+        if two_hands_active:
+            cv2.putText(frame, "Two hands detected - paused", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            prev_x = None
-            motion_acc = 0.0
-            dir_consistency = 0
-            current_dir = 0
-            last_block_reason = "two_hands"
-
-            reentry_freeze_until = time.time() + 0.4
-
+            draw_doc_ui(frame)
             cv2.imshow("Gesture Control", frame)
             if cv2.waitKey(1) & 0xFF == 27: break
             continue
 
-        dx_debug = 0.0
-
+        # -----------------------------
+        # ONE-HAND LOGIC
+        # -----------------------------
         if results.multi_hand_landmarks:
             hand = results.multi_hand_landmarks[0]
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
+            # quick visibility / size check
+            area = hand_bbox_area(hand)
+            if area < MIN_HAND_AREA:
+                draw_doc_ui(frame)
+                cv2.putText(frame, "Hand too small - move closer", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 200), 2)
+                cv2.imshow("Gesture Control", frame)
+                if cv2.waitKey(1) & 0xFF == 27: break
+                continue
+
+            # -----------------------------
+            # ROBUST MULTI-FINGER PINCH TOGGLE
+            # -----------------------------
+            d_index, d_middle, d_ring = pinch_metrics(hand)
+
+            pinch_history.append((
+                d_index,
+                d_index < PINCH_INDEX_MAX and
+                d_middle > PINCH_OTHERS_MIN and
+                d_ring > PINCH_OTHERS_MIN
+            ))
+
+            if len(pinch_history) == 5:
+                pinch_frames = sum(1 for _, is_pinch in pinch_history if is_pinch)
+                pinch_confident = pinch_frames >= 4   # was 3 — stricter confirmation
+
+                if pinch_confident and now - last_pinch_toggle > PINCH_DEBOUNCE:
+                    file_mode = not file_mode
+                    last_pinch_toggle = now
+
+                    if file_mode:
+                        armed = False
+                        print("[PINCH] FILE MODE ON — browsing files")
+                    else:
+                        armed = True
+                        print(f"[PINCH] FILE MODE OFF — selected + ARMED: {documents[current_index]['name']}")
+
+            # -----------------------------
+            # ML SWIPE DETECTION
+            # -----------------------------
             features = extract_features(hand)
             sequence.append(features)
 
-            tip = hand.landmark[8]
-            x = tip.x
+            # GRACE PERIOD: ignore gestures right after hand appears
+            if hand_present_frames < HAND_APPEAR_GRACE:
+                draw_doc_ui(frame)
+                cv2.imshow("Gesture Control", frame)
+                if cv2.waitKey(1) & 0xFF == 27: break
+                continue
 
-            if prev_x is not None:
-                dx = x - prev_x
-                dx_debug = dx
+            if len(sequence) == SEQ_LENGTH:
+                seq_array = np.array(sequence, dtype=np.float32).reshape(1, SEQ_LENGTH, FEATURE_SIZE)
+                preds = model.predict(seq_array, verbose=0)[0]
 
-                if abs(dx) < VELOCITY_GATE:
-                    motion_acc = 0.0
-                    dir_consistency = 0
-                    last_block_reason = "velocity"
-                    prev_x = x
+                # get best and second best
+                sorted_idx = np.argsort(preds)[::-1]
+                best_idx = sorted_idx[0]
+                second_idx = sorted_idx[1] if len(sorted_idx) > 1 else best_idx
+                pred_label = label_classes[best_idx]
+                max_conf = preds[best_idx]
+                second_conf = preds[second_idx]
+
+                # push into prediction buffer for smoothing
+                pred_buffer.append((pred_label, float(max_conf)))
+
+                # quick confirmation from buffer
+                is_vertical = pred_label in ("swipe_up", "swipe_down")
+                confirm_count = CONFIRM_COUNT_V if is_vertical else CONFIRM_COUNT_H
+                if not confirm_from_buffer(pred_label, confirm_count):
+                    # not yet confirmed
+                    pass
                 else:
-                    inst_dir = 1 if dx > 0 else -1
-                    if inst_dir != current_dir:
-                        motion_acc = 0.0
-                        dir_consistency = 0
-                        current_dir = inst_dir
-                    else:
-                        dir_consistency += 1
+                    # check absolute confidence and margin
+                    if max_conf >= CONF_THRESHOLD and (max_conf - second_conf) >= 0.03:
+                        # prevent immediate opposite swipe after a swipe
+                        opposite = None
+                        if pred_label == "swipe_left":
+                            opposite = "swipe_right"
+                        elif pred_label == "swipe_right":
+                            opposite = "swipe_left"
+                        elif pred_label == "swipe_up":
+                            opposite = "swipe_down"
+                        elif pred_label == "swipe_down":
+                            opposite = "swipe_up"
 
-                    motion_acc += dx
-                    last_block_reason = ""
+                        # if opposite was just triggered recently, ignore this one
+                        debounce = OPPOSITE_DEBOUNCE_V if is_vertical else OPPOSITE_DEBOUNCE_H
+                        if opposite and last_swipe == opposite and (now - last_swipe_time) < debounce:
+                            # ignore due to opposite debounce
+                            pred_buffer.clear()
+                        else:
+                            # check per-gesture cooldown
+                            if now < PER_GESTURE_COOLDOWN.get(pred_label, 0.0):
+                                pred_buffer.clear()
+                            else:
+                                # -----------------------------
+                                # FILE MODE: ONLY UP/DOWN
+                                # -----------------------------
+                                if file_mode:
+                                    if pred_label == "swipe_up":
+                                        current_index = (current_index - 1) % len(documents)
+                                        print(f"[FILE SELECT] {documents[current_index]['name']}")
+                                        PER_GESTURE_COOLDOWN['swipe_up'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_up'
+                                        last_swipe_time = now
+                                    elif pred_label == "swipe_down":
+                                        current_index = (current_index + 1) % len(documents)
+                                        print(f"[FILE SELECT] {documents[current_index]['name']}")
+                                        PER_GESTURE_COOLDOWN['swipe_down'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_down'
+                                        last_swipe_time = now
+                                    last_action_time = now
+                                    sequence.clear()
+                                    pred_buffer.clear()
+                                    continue
 
-            prev_x = x
+                                # -----------------------------
+                                # NORMAL MODE
+                                # -----------------------------
+                                if not armed:
+                                    if pred_label == "swipe_left":
+                                        print("[SLIDE] Next")
+                                        PER_GESTURE_COOLDOWN['swipe_left'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_left'
+                                        last_swipe_time = now
+                                        sequence.clear()
+                                    elif pred_label == "swipe_right":
+                                        print("[SLIDE] Previous")
+                                        PER_GESTURE_COOLDOWN['swipe_right'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_right'
+                                        last_swipe_time = now
+                                        sequence.clear()
 
-            if 0.5 - DEAD_ZONE < x < 0.5 + DEAD_ZONE:
-                last_block_reason = "dead_zone"
-            elif dir_consistency < MIN_DIR_FRAMES:
-                last_block_reason = "dir_frames"
-            elif abs(motion_acc) < MIN_TRAVEL:
-                last_block_reason = "travel"
-            else:
-                last_block_reason = ""
+                                # -----------------------------
+                                # SEND / CANCEL ONLY WHEN ARMED
+                                # -----------------------------
+                                if armed:
+                                    if pred_label == "swipe_up":
+                                        doc = documents[current_index]
+                                        print(f"[SEND TRIGGER] {doc['name']}")
+                                        send_document(doc)
+                                        armed = False
+                                        freeze_until = now + FREEZE_TIME
+                                        PER_GESTURE_COOLDOWN['swipe_up'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_up'
+                                        last_swipe_time = now
+                                        sequence.clear()
+                                    elif pred_label == "swipe_down":
+                                        armed = False
+                                        print("[CANCEL] Disarmed")
+                                        PER_GESTURE_COOLDOWN['swipe_down'] = now + COOLDOWN_TIME
+                                        last_swipe = 'swipe_down'
+                                        last_swipe_time = now
+                                        sequence.clear()
 
-                if len(sequence) == SEQ_LENGTH:
-                    seq_array = np.array(sequence, dtype=np.float32).reshape(1, SEQ_LENGTH, FEATURE_SIZE)
-                    preds = model.predict(seq_array, verbose=0)[0]
+                                last_action_time = now
+                                pred_buffer.clear()
 
-                    gesture_indices = [i for i, lbl in enumerate(label_classes) if lbl != "no_gesture"]
-                    best_idx = gesture_indices[np.argmax(preds[gesture_indices])]
-
-                    pred_label = label_classes[best_idx]
-                    max_conf = preds[best_idx]
-
-                    if max_conf > CONF_THRESHOLD:
-                        now = time.time()
-                        if now - last_action_time > COOLDOWN_TIME:
-
-                            if pred_label == "swipe_left":
-                                print("Previous Slide")
-                                pyautogui.press("left")
-
-                            elif pred_label == "swipe_right":
-                                print("Next Slide")
-                                pyautogui.press("right")
-
-                            last_action_time = now
-                            freeze_until = time.time() + FREEZE_TIME
-
-                            motion_acc = 0.0
-                            prev_x = None
-                            dir_consistency = 0
-                            current_dir = 0
-
-        else:
-            prev_x = None
-            motion_acc = 0.0
-            dir_consistency = 0
-            current_dir = 0
-            last_block_reason = "no_hand"
-
-        cv2.putText(frame, f"dx={dx_debug:.3f} acc={motion_acc:.3f} dir={dir_consistency}",
-                    (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
-        cv2.putText(frame, f"block={last_block_reason}",
-                    (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-
+        # -----------------------------
+        # DRAW UI
+        # -----------------------------
+        draw_doc_ui(frame)
         cv2.imshow("Gesture Control", frame)
         if cv2.waitKey(1) & 0xFF == 27: break
 

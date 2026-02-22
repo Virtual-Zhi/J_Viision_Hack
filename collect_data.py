@@ -19,6 +19,7 @@ GESTURE_LABELS = {
     ord('n'): "no_gesture"
 }
 
+
 # Feature Extraction
 def extract_features(hand_landmarks):
     """Flatten 21 Mediapipe landmarks into a 63D feature vector."""
